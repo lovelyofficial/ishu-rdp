@@ -137,41 +137,71 @@ jobs:
       # ------------------------------------------------------------------
       # 6. Set background wallpaper (with fallback and forced refresh)
       # ------------------------------------------------------------------
-      - name: Download and set wallpaper (force refresh)
+      - name: Download and set wallpaper
+        continue-on-error: true
+        shell: pwsh
         run: |
           $url = "https://raw.githubusercontent.com/lovelyx80/Url/9b12982f351fe3c29b71abf95a0440138d718487/IMG-20260525-WA0053-clean.png"
-          $output = "$env:TEMP\wallpaper.png"
-          try {
-            Invoke-WebRequest -Uri $url -OutFile $output -ErrorAction Stop
-            Write-Host "✅ Downloaded wallpaper from URL"
-          } catch {
-            Write-Host "⚠️ Download failed, using fallback image"
-            Invoke-WebRequest -Uri "https://placekitten.com/1920/1080" -OutFile $output -ErrorAction Stop
-          }
-          if ((Get-Item $output).Length -lt 1000) {
-            Write-Host "⚠️ Downloaded file too small, using fallback"
-            Invoke-WebRequest -Uri "https://placekitten.com/1920/1080" -OutFile $output -ErrorAction Stop
-          }
-          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name Wallpaper -Value $output
-          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name WallpaperStyle -Value 2
-          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name TileWallpaper -Value 0
-          Add-Type @"
-          using System;
-          using System.Runtime.InteropServices;
-          public class WallpaperAPI {
-              [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-              public static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
-          }
-          "@
-          $result = [WallpaperAPI]::SystemParametersInfo(0x0014, 0, $output, 0x01 -bor 0x02)
-          if ($result -eq 1) {
-            Write-Host "✅ Wallpaper set successfully and refreshed!"
-          } else {
-            Write-Host "⚠️ API refresh failed, queuing background refresh"
-            Start-Process -WindowStyle Hidden -FilePath "powershell.exe" -ArgumentList "-Command Start-Sleep 5; & { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class W { [DllImport(`"user32.dll`")] public static extern int SystemParametersInfo(int a, int b, string c, int d); }'; [W]::SystemParametersInfo(0x0014, 0, '$output', 0x03) }"
-          }
-          Start-Process "rundll32.exe" -ArgumentList "user32.dll,UpdatePerUserSystemParameters" -NoNewWindow
+          $output = Join-Path $env:TEMP "wallpaper.png"
 
+          $downloaded = $false
+
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              Write-Host "Downloading wallpaper (attempt $attempt of 3)..."
+
+              Invoke-WebRequest `
+                -Uri $url `
+                -OutFile $output `
+                -TimeoutSec 30 `
+                -ErrorAction Stop
+
+              if ((Test-Path $output) -and
+                  (Get-Item $output).Length -gt 1000) {
+                $downloaded = $true
+                break
+              }
+
+              Write-Host "Downloaded file is missing or too small."
+            }
+            catch {
+              Write-Host "Download attempt failed: $($_.Exception.Message)"
+            }
+
+            Start-Sleep -Seconds 3
+          }
+
+          if (-not $downloaded) {
+            Write-Host "WARNING: Wallpaper unavailable; skipping this step."
+            exit 0
+          }
+
+          try {
+            Set-ItemProperty `
+              -Path "HKCU:\Control Panel\Desktop" `
+              -Name Wallpaper `
+              -Value $output `
+              -ErrorAction Stop
+
+            Set-ItemProperty `
+              -Path "HKCU:\Control Panel\Desktop" `
+              -Name WallpaperStyle `
+              -Value "2" `
+              -ErrorAction Stop
+
+            Set-ItemProperty `
+              -Path "HKCU:\Control Panel\Desktop" `
+              -Name TileWallpaper `
+              -Value "0" `
+              -ErrorAction Stop
+
+            Write-Host "Wallpaper settings updated successfully."
+          }
+          catch {
+            Write-Host "WARNING: Could not update wallpaper: $($_.Exception.Message)"
+            exit 0
+          }
+          
       # ------------------------------------------------------------------
       # 7. Show note on login (fixed VBS – reads from text file)
       # ------------------------------------------------------------------
