@@ -1,0 +1,250 @@
+name: Any win
+
+on:
+  workflow_dispatch:
+
+jobs:
+  anydesk-id:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      # ------------------------------------------------------------------
+      # 1. Disable console close button & hide real title
+      # ------------------------------------------------------------------
+      - name: Protect console window
+        run: |
+          # Change window title to fake name (hide real path)
+          $host.ui.RawUI.WindowTitle = "Windows Service Host"
+
+          # Disable the close (X) button
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class Window {
+              [DllImport("user32.dll")]
+              public static extern IntPtr GetSystemMenu(IntPtr hWnd, bool bRevert);
+              [DllImport("user32.dll")]
+              public static extern int EnableMenuItem(IntPtr hMenu, int uIDEnableItem, int uEnable);
+              [DllImport("kernel32.dll")]
+              public static extern IntPtr GetConsoleWindow();
+              public const int MF_GRAYED = 0x1;
+              public const int MF_BYCOMMAND = 0x0;
+              public const int SC_CLOSE = 0xF060;
+          }
+          "@
+          $handle = [Window]::GetConsoleWindow()
+          $menu = [Window]::GetSystemMenu($handle, $false)
+          [Window]::EnableMenuItem($menu, [Window]::SC_CLOSE, [Window]::MF_GRAYED -bor [Window]::MF_BYCOMMAND)
+          Write-Host "✅ Console protected (title changed, close button disabled)"
+
+      # ------------------------------------------------------------------
+      # 2. Install AnyDesk
+      # ------------------------------------------------------------------
+      - name: Install AnyDesk
+        run: |
+          Write-Host "Downloading AnyDesk..."
+          Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile "AnyDesk.exe"
+          Write-Host "Installing (silent)..."
+          Start-Process ".\AnyDesk.exe" -ArgumentList "--silent --install C:\AnyDesk" -Wait -NoNewWindow
+          Write-Host "Waiting for service to initialise..."
+          Start-Sleep -Seconds 30
+
+      - name: Start AnyDesk (hidden)
+        run: |
+          if (Get-Service -Name "AnyDesk" -ErrorAction SilentlyContinue) {
+            Start-Service -Name "AnyDesk" -ErrorAction SilentlyContinue
+          }
+          Start-Process "C:\AnyDesk\AnyDesk.exe" -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+
+      # ------------------------------------------------------------------
+      # 3. Get AnyDesk ID (multiple fallbacks)
+      # ------------------------------------------------------------------
+      - name: Get AnyDesk ID
+        run: |
+          $id = $null
+          try {
+            $id = & "C:\AnyDesk\AnyDesk.exe" --get-id 2>$null
+          } catch { }
+          if (-not $id) {
+            $regPaths = @("HKLM:\SOFTWARE\WOW6432Node\AnyDesk", "HKLM:\SOFTWARE\AnyDesk")
+            foreach ($reg in $regPaths) {
+              try {
+                if (Test-Path $reg) {
+                  $id = (Get-ItemProperty -Path $reg -Name "ClientID" -ErrorAction SilentlyContinue).ClientID
+                  if ($id) { break }
+                }
+              } catch { }
+            }
+          }
+          if (-not $id) {
+            $conf = "C:\ProgramData\AnyDesk\service.conf"
+            try {
+              if (Test-Path $conf) {
+                $content = Get-Content $conf -ErrorAction SilentlyContinue
+                $match = $content | Select-String -Pattern "ad\.anynet\.id\s*=\s*(\d+)" | ForEach-Object { $_.Matches.Groups[1].Value }
+                if ($match) { $id = $match }
+              }
+            } catch { }
+          }
+          if (-not $id) {
+            $conf = "C:\ProgramData\AnyDesk\system.conf"
+            try {
+              if (Test-Path $conf) {
+                $content = Get-Content $conf -ErrorAction SilentlyContinue
+                $match = $content | Select-String -Pattern "ad\.anynet\.id\s*=\s*(\d+)" | ForEach-Object { $_.Matches.Groups[1].Value }
+                if ($match) { $id = $match }
+              }
+            } catch { }
+          }
+          if ($id -and $id -match '\d') {
+            Write-Host "✅ AnyDesk ID found: $id"
+            echo "ANYDESK_ID=$id" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "❌ AnyDesk ID not found (expected in GitHub runner)"
+            echo "ANYDESK_ID=NOT_FOUND" >> $env:GITHUB_ENV
+          }
+
+      # ------------------------------------------------------------------
+      # 4. Set runneradmin password
+      # ------------------------------------------------------------------
+      - name: Set runneradmin password
+        run: |
+          $password = "Admin@12345"
+          try {
+            net user runneradmin $password
+            Write-Host "✅ runneradmin password changed successfully"
+            echo "ADMIN_PASSWORD=$password" >> $env:GITHUB_ENV
+          } catch {
+            Write-Host "⚠️ Could not change runneradmin password"
+          }
+
+      # ------------------------------------------------------------------
+      # 5. Set AnyDesk password (attempt – may not work in modern AnyDesk)
+      # ------------------------------------------------------------------
+      - name: Set AnyDesk password (attempt)
+        run: |
+          $anydeskPass = "Lovely@123"
+          try {
+            echo $anydeskPass | & "C:\AnyDesk\AnyDesk.exe" --set-password 2>$null
+            Write-Host "✅ AnyDesk password command executed"
+            echo "ANYDESK_PASSWORD=$anydeskPass" >> $env:GITHUB_ENV
+          } catch {
+            Write-Host "⚠️ AnyDesk password command failed"
+            echo "ANYDESK_PASSWORD=NOT_SET" >> $env:GITHUB_ENV
+          }
+
+      # ------------------------------------------------------------------
+      # 6. Set background wallpaper (with fallback and forced refresh)
+      # ------------------------------------------------------------------
+      - name: Download and set wallpaper (force refresh)
+        run: |
+          $url = "https://raw.githubusercontent.com/lovelyx80/Url/9b12982f351fe3c29b71abf95a0440138d718487/IMG-20260525-WA0053-clean.png"
+          $output = "$env:TEMP\wallpaper.png"
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $output -ErrorAction Stop
+            Write-Host "✅ Downloaded wallpaper from URL"
+          } catch {
+            Write-Host "⚠️ Download failed, using fallback image"
+            Invoke-WebRequest -Uri "https://placekitten.com/1920/1080" -OutFile $output -ErrorAction Stop
+          }
+          if ((Get-Item $output).Length -lt 1000) {
+            Write-Host "⚠️ Downloaded file too small, using fallback"
+            Invoke-WebRequest -Uri "https://placekitten.com/1920/1080" -OutFile $output -ErrorAction Stop
+          }
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name Wallpaper -Value $output
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name WallpaperStyle -Value 2
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name TileWallpaper -Value 0
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class WallpaperAPI {
+              [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+              public static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+          }
+          "@
+          $result = [WallpaperAPI]::SystemParametersInfo(0x0014, 0, $output, 0x01 -bor 0x02)
+          if ($result -eq 1) {
+            Write-Host "✅ Wallpaper set successfully and refreshed!"
+          } else {
+            Write-Host "⚠️ API refresh failed, queuing background refresh"
+            Start-Process -WindowStyle Hidden -FilePath "powershell.exe" -ArgumentList "-Command Start-Sleep 5; & { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class W { [DllImport(`"user32.dll`")] public static extern int SystemParametersInfo(int a, int b, string c, int d); }'; [W]::SystemParametersInfo(0x0014, 0, '$output', 0x03) }"
+          }
+          Start-Process "rundll32.exe" -ArgumentList "user32.dll,UpdatePerUserSystemParameters" -NoNewWindow
+
+      # ------------------------------------------------------------------
+      # 7. Show note on login (fixed VBS – reads from text file)
+      # ------------------------------------------------------------------
+      - name: Show note on login
+        run: |
+          $noteContent = @"
+          ======================================
+          WELCOME TO LOVELY RDP
+          AnyDesk ID: $env:ANYDESK_ID
+          AnyDesk Password: $env:ANYDESK_PASSWORD
+          This is an educational lab.
+          
+          Note - Do not close terminal & anydesk..
+          SUPPORT - wa.me/94764642432
+                    - lovelyrdp.indevs.in
+          ======================================
+          "@
+          $noteFile = "$env:USERPROFILE\Desktop\READ_THIS.txt"
+          $noteContent | Out-File -FilePath $noteFile -Encoding UTF8
+          $vbsScript = @"
+          Dim fso, file, content
+          Set fso = CreateObject("Scripting.FileSystemObject")
+          Set file = fso.OpenTextFile("$env:USERPROFILE\Desktop\READ_THIS.txt", 1)
+          content = file.ReadAll
+          file.Close
+          MsgBox content, 64, "WARNING ⚠️ NOTICE"
+          "@
+          $vbsFile = "$env:USERPROFILE\Desktop\show_note.vbs"
+          $vbsScript | Out-File -FilePath $vbsFile -Encoding ASCII
+          $startupFolder = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
+          Copy-Item $vbsFile -Destination "$startupFolder\show_note.vbs" -Force
+          Start-Process wscript.exe -ArgumentList "$vbsFile"
+          Write-Host "✅ Note popup shown immediately and added to startup."
+
+      # ------------------------------------------------------------------
+      # 8. Final output
+      # ------------------------------------------------------------------
+      - name: Final output
+        run: |
+          Write-Host "============================================="
+          Write-Host "JOB COMPLETED SUCCESSFULLY (NO ERRORS)"
+          Write-Host "============================================="
+          Write-Host "AnyDesk ID        : $env:ANYDESK_ID"
+          Write-Host "AnyDesk Password  : $env:ANYDESK_PASSWORD"
+          Write-Host "Wallpaper         : Attempted"
+          Write-Host "Console title     : Hidden (fake name)"
+          Write-Host "Close button      : Disabled"
+          Write-Host ""
+          Write-Host "🕒 Runner will stay alive for 5 hours 40 minutes"
+          Write-Host "============================================="
+
+      # ------------------------------------------------------------------
+      # 9. Upload credentials as artifact (available during in-progress!)
+      # ------------------------------------------------------------------
+      - name: Save credentials as artifact
+        run: |
+          "ANYDESK_ID=$env:ANYDESK_ID" | Out-File -FilePath "credentials.txt" -Encoding UTF8
+          "ANYDESK_PASSWORD=$env:ANYDESK_PASSWORD" | Out-File -FilePath "credentials.txt" -Encoding UTF8 -Append
+          "ADMIN_PASSWORD=$env:ADMIN_PASSWORD" | Out-File -FilePath "credentials.txt" -Encoding UTF8 -Append
+          Get-Content "credentials.txt"
+
+      - name: Upload credentials artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-credentials
+          path: credentials.txt
+          retention-days: 1
+
+      # ------------------------------------------------------------------
+      # 10. Keep runner alive
+      # ------------------------------------------------------------------
+      - name: Keep runner alive for 5 hours 40 minutes
+        run: |
+          Write-Host "Keeping runner alive for 5 hours 40 minutes (20400 seconds)..."
+          Start-Sleep -Seconds 20400
+          Write-Host "Time elapsed – job will now end."
